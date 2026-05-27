@@ -8,9 +8,12 @@ takes a photo and uploads it as JPEG to the configured target URL.
 Edit `src/main.cpp` before flashing:
 
 ```cpp
-const char* ssid      = "DEIN_WLAN";
-const char* password  = "DEIN_PASSWORT";
-const char* targetUrl = "http://192.168.1.100/upload.php";
+constexpr char kWifiSsid[] = "DEIN_WLAN";
+constexpr char kWifiPassword[] = "DEIN_PASSWORT";
+
+constexpr char kTargetHost[] = "192.168.1.100";
+constexpr uint16_t kTargetPort = 8001;
+constexpr char kTargetPath[] = "/upload.php";
 ```
 
 ## Build
@@ -67,4 +70,4 @@ Call the trigger endpoint from a browser or terminal:
 curl http://<ESP32-IP>/trigger
 ```
 
-The firmware then captures one image and posts it to `targetUrl`.
+The firmware then captures one image and posts it to the configured target.
