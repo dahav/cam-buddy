@@ -53,11 +53,28 @@ uint8_t targetBssid[6] = {0xEC, 0x6C, 0x9A, 0x3C, 0xA1, 0x92};
 
 WebServer server(80);
 
-bool triggerPending = false;
-bool jobRunning = false;
+volatile bool triggerPending = false;
+volatile bool jobRunning = false;
 int lastUploadCode = 0;
 uint32_t lastJobStartedAt = 0;
 uint32_t lastJobFinishedAt = 0;
+uint32_t triggerAcceptedAt = 0;
+TaskHandle_t jobTaskHandle = nullptr;
+const char* jobPhase = "IDLE";
+
+struct UploadJob {
+  uint8_t* data;
+  size_t len;
+};
+
+String currentJobAgeText() {
+  if (!jobRunning && !triggerPending) {
+    return "0";
+  }
+
+  uint32_t startedAt = lastJobStartedAt != 0 ? lastJobStartedAt : triggerAcceptedAt;
+  return String(millis() - startedAt);
+}
 
 // ============================================================
 //  Netzwerk-Diagnose
@@ -140,8 +157,9 @@ bool initCamera() {
 // ============================================================
 int postJpegFixedLength(const uint8_t* data, size_t len) {
   WiFiClient client;
-  client.setTimeout(60000);
+  client.setTimeout(10000);
 
+  jobPhase = "CONNECT";
   Serial.printf("HTTP Connect: %s:%u%s\n", targetHost, targetPort, targetPath);
 
   if (!client.connect(targetHost, targetPort)) {
@@ -154,6 +172,7 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
   // ----------------------------------------------------------
   // Header senden
   // ----------------------------------------------------------
+  jobPhase = "SEND_HEADER";
   client.printf("POST %s HTTP/1.1\r\n", targetPath);
   client.printf("Host: %s:%u\r\n", targetHost, targetPort);
   client.print("Content-Type: image/jpeg\r\n");
@@ -183,6 +202,7 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
 
   bool firstWriteLogged = false;
 
+  jobPhase = "SEND_BODY";
   while (remaining > 0) {
     if (!client.connected()) {
       Serial.println("TCP getrennt während Upload");
@@ -206,7 +226,7 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
       continue;
     }
 
-    if (millis() - lastProgress > 30000) {
+    if (millis() - lastProgress > 15000) {
       Serial.println("Upload-Stall - Abbruch");
       client.stop();
       return -3;
@@ -215,8 +235,6 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
     delay(1);
   }
 
-  client.flush();
-
   Serial.printf("Upload gesendet in %lu ms (%u Bytes)\n",
                 millis() - startedAt,
                 (unsigned int)len);
@@ -224,10 +242,34 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
   // ----------------------------------------------------------
   // Antwort lesen
   // ----------------------------------------------------------
-  client.setTimeout(15000);
+  jobPhase = "READ_RESPONSE";
+  client.setTimeout(10000);
 
-  String statusLine = client.readStringUntil('\n');
-  statusLine.trim();
+  String statusLine;
+  uint32_t responseDeadline = millis() + 10000;
+  while (millis() < responseDeadline) {
+    while (client.available()) {
+      char c = (char)client.read();
+      if (c == '\n') {
+        responseDeadline = millis();
+        break;
+      }
+
+      if (c != '\r' && statusLine.length() < 120) {
+        statusLine += c;
+      }
+    }
+
+    if (statusLine.length() > 0 && millis() >= responseDeadline) {
+      break;
+    }
+
+    if (!client.connected() && !client.available()) {
+      break;
+    }
+
+    delay(1);
+  }
 
   Serial.printf("Antwort: %s\n", statusLine.c_str());
 
@@ -245,11 +287,22 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
 
   int code = codeText.toInt();
 
-  // Optional: Rest der Antwort ausgeben
-  while (client.connected() || client.available()) {
-    String line = client.readStringUntil('\n');
-    if (line.length() == 0) break;
-    Serial.println(line);
+  // Rest nur kurz und nicht-blockierend ausgeben. Manche Server halten die
+  // Verbindung trotz "Connection: close" noch offen; readStringUntil() wuerde
+  // hier sonst wiederholt bis zum Timeout blockieren.
+  uint32_t drainUntil = millis() + 500;
+  while (millis() < drainUntil) {
+    while (client.available()) {
+      char c = (char)client.read();
+      Serial.print(c);
+      drainUntil = millis() + 50;
+    }
+
+    if (!client.connected()) {
+      break;
+    }
+
+    delay(1);
   }
 
   client.stop();
@@ -258,37 +311,63 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
 }
 
 // ============================================================
-//  Foto aufnehmen, kopieren, Kamera freigeben, senden
+//  Foto aufnehmen, kopieren, Kamera freigeben
 // ============================================================
-int captureAndSend() {
+int captureJpegCopy(uint8_t** outData, size_t* outLen) {
+  *outData = nullptr;
+  *outLen = 0;
+
+  jobPhase = "CAPTURE";
   printWiFiStatus();
 
-  // Erstes evtl. altes Bild verwerfen
-  camera_fb_t* fb = esp_camera_fb_get();
-  if (fb) {
-    esp_camera_fb_return(fb);
+  camera_fb_t* fb = nullptr;
+
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    // Erstes evtl. altes Bild verwerfen.
+    fb = esp_camera_fb_get();
+    if (fb) {
+      esp_camera_fb_return(fb);
+      delay(30);
+    }
+
+    fb = esp_camera_fb_get();
+    if (fb) {
+      break;
+    }
+
+    Serial.printf("Aufnahme fehlgeschlagen, Versuch %d/3\n", attempt);
+    delay(250);
   }
 
-  fb = esp_camera_fb_get();
   if (!fb) {
-    Serial.println("Aufnahme fehlgeschlagen");
-    return -1;
+    Serial.println("Kamera liefert keinen Frame, reinitialisiere");
+    esp_camera_deinit();
+    delay(300);
+
+    if (!initCamera()) {
+      Serial.println("Kamera-Reinit fehlgeschlagen");
+      return -1;
+    }
+
+    delay(500);
+    fb = esp_camera_fb_get();
+    if (!fb) {
+      Serial.println("Aufnahme nach Kamera-Reinit fehlgeschlagen");
+      return -1;
+    }
   }
 
   const size_t len = fb->len;
   Serial.printf("Bild: %u Bytes\n", (unsigned int)len);
 
   uint8_t* copy = nullptr;
-
   if (psramFound()) {
     copy = (uint8_t*)ps_malloc(len);
   }
-
   if (!copy) {
     Serial.println("PSRAM-Kopie fehlgeschlagen, versuche internen Speicher");
     copy = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_8BIT);
   }
-
   if (!copy) {
     Serial.println("Speicher für Bildkopie fehlgeschlagen");
     esp_camera_fb_return(fb);
@@ -297,17 +376,14 @@ int captureAndSend() {
 
   memcpy(copy, fb->buf, len);
 
-  // Kamera sofort freigeben
+  // Kamera sofort freigeben.
   esp_camera_fb_return(fb);
 
-  Serial.println("HTTP POST mit fester Content-Length...");
-  int code = postJpegFixedLength(copy, len);
+  *outData = copy;
+  *outLen = len;
 
-  Serial.printf("Upload-HTTP %d\n", code);
-
-  free(copy);
-
-  return code;
+  jobPhase = "CAPTURE_DONE";
+  return 0;
 }
 
 // ============================================================
@@ -317,11 +393,15 @@ void handleTrigger() {
   Serial.println("Trigger empfangen -> Foto");
 
   if (triggerPending || jobRunning) {
-    server.send(409, "text/plain", "BUSY: Foto-Job laeuft bereits\n");
+    String body = "BUSY: Foto-Job laeuft bereits\nphase=" + String(jobPhase) +
+                  "\nage_ms=" + currentJobAgeText() + "\n";
+    server.send(409, "text/plain", body);
     return;
   }
 
   triggerPending = true;
+  triggerAcceptedAt = millis();
+  jobPhase = "PENDING";
   server.send(202, "text/plain", "ACCEPTED: Foto-Job gestartet\n");
 }
 
@@ -341,6 +421,8 @@ void handleStatus() {
   }
 
   String body = "status=" + status +
+                "\nphase=" + String(jobPhase) +
+                "\nage_ms=" + currentJobAgeText() +
                 "\nlast_upload_code=" + String(lastUploadCode) +
                 "\nlast_started_ms=" + String(lastJobStartedAt) +
                 "\nlast_finished_ms=" + String(lastJobFinishedAt) +
@@ -349,8 +431,36 @@ void handleStatus() {
   server.send(200, "text/plain", body);
 }
 
+void triggerJobTask(void* parameter) {
+  UploadJob* job = (UploadJob*)parameter;
+
+  Serial.println("HTTP POST mit fester Content-Length...");
+  int code = postJpegFixedLength(job->data, job->len);
+  Serial.printf("Upload-HTTP %d\n", code);
+  lastUploadCode = code;
+  lastJobFinishedAt = millis();
+
+  free(job->data);
+  free(job);
+
+  if (code >= 200 && code < 300) {
+    Serial.printf("Foto-Job OK (%d)\n", code);
+  } else {
+    Serial.printf("Foto-Job FEHLER (%d)\n", code);
+  }
+
+  jobTaskHandle = nullptr;
+  jobPhase = "IDLE";
+  jobRunning = false;
+  vTaskDelete(nullptr);
+}
+
 void runPendingTrigger() {
   if (!triggerPending || jobRunning) {
+    return;
+  }
+
+  if (millis() - triggerAcceptedAt < 50) {
     return;
   }
 
@@ -358,15 +468,52 @@ void runPendingTrigger() {
   jobRunning = true;
   lastJobStartedAt = millis();
 
-  int code = captureAndSend();
-  lastUploadCode = code;
-  lastJobFinishedAt = millis();
-  jobRunning = false;
+  uint8_t* imageData = nullptr;
+  size_t imageLen = 0;
+  int captureCode = captureJpegCopy(&imageData, &imageLen);
 
-  if (code >= 200 && code < 300) {
-    Serial.printf("Foto-Job OK (%d)\n", code);
-  } else {
-    Serial.printf("Foto-Job FEHLER (%d)\n", code);
+  if (captureCode != 0) {
+    lastUploadCode = captureCode;
+    lastJobFinishedAt = millis();
+    jobPhase = "IDLE";
+    jobRunning = false;
+    Serial.printf("Foto-Job FEHLER (%d)\n", captureCode);
+    return;
+  }
+
+  UploadJob* job = (UploadJob*)malloc(sizeof(UploadJob));
+  if (!job) {
+    free(imageData);
+    lastUploadCode = -9;
+    lastJobFinishedAt = millis();
+    jobPhase = "IDLE";
+    jobRunning = false;
+    Serial.println("Speicher fuer Upload-Job fehlgeschlagen");
+    return;
+  }
+
+  job->data = imageData;
+  job->len = imageLen;
+
+  BaseType_t created = xTaskCreatePinnedToCore(
+    triggerJobTask,
+    "trigger-job",
+    8192,
+    job,
+    1,
+    &jobTaskHandle,
+    1
+  );
+
+  if (created != pdPASS) {
+    free(job->data);
+    free(job);
+    Serial.println("Foto-Job Task konnte nicht gestartet werden");
+    jobTaskHandle = nullptr;
+    jobPhase = "IDLE";
+    jobRunning = false;
+    lastUploadCode = -8;
+    lastJobFinishedAt = millis();
   }
 }
 
