@@ -1,1 +1,1 @@
-ACCEPTED: Foto-Job gestartet
+OK: Foto gesendet (200)

@@ -1,11 +1,10 @@
 /*
- * ESP32-CAM  -  Extern getriggerter Foto-Upload
- * --------------------------------------------------------
- *  - Der ESP32-CAM läuft als kleiner HTTP-Server.
- *  - GET /trigger löst ein Foto aus.
- *  - Das Foto wird per HTTP-POST mit fester Content-Length gesendet.
- *  - Fix: Body wird direkt per client.write() gesendet,
- *    ohne blockierende availableForWrite()-Vorprüfung.
+ * ESP32-CAM - per HTTP getriggerter Foto-Upload
+ *
+ * GET /trigger:
+ *   - nimmt ein Foto auf
+ *   - sendet es per HTTP POST an den Zielserver
+ *   - antwortet erst, wenn der Upload fertig ist
  */
 
 #include <Arduino.h>
@@ -16,23 +15,21 @@
 #include "esp_wifi.h"
 
 // ============================================================
-//  ANPASSEN
+//  Konfiguration
 // ============================================================
-const char* ssid       = "DIBO13";
-const char* password   = "b82@qPSt";
+const char* wifiSsid = "DIBO13";
+const char* wifiPassword = "b82@qPSt";
 
-// Ziel, an das das Foto per POST geschickt wird:
 const char* targetHost = "192.168.0.10";
 const uint16_t targetPort = 8001;
 const char* targetPath = "/solve/togaf";
-const char* apiKey     = "1234567";
+const char* apiKey = "1234567";
 
-// Fester AP / Mesh-Knoten.
-// Auf {0,0,0,0,0,0} setzen, um automatisch wählen zu lassen.
+// Auf {0,0,0,0,0,0} setzen, um den Access Point automatisch zu waehlen.
 uint8_t targetBssid[6] = {0xEC, 0x6C, 0x9A, 0x3C, 0xA1, 0x92};
 
 // ============================================================
-//  Kamera-Pinbelegung AI-Thinker ESP32-CAM
+//  AI-Thinker ESP32-CAM Pins
 // ============================================================
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
@@ -53,31 +50,8 @@ uint8_t targetBssid[6] = {0xEC, 0x6C, 0x9A, 0x3C, 0xA1, 0x92};
 
 WebServer server(80);
 
-volatile bool triggerPending = false;
-volatile bool jobRunning = false;
-int lastUploadCode = 0;
-uint32_t lastJobStartedAt = 0;
-uint32_t lastJobFinishedAt = 0;
-uint32_t triggerAcceptedAt = 0;
-TaskHandle_t jobTaskHandle = nullptr;
-const char* jobPhase = "IDLE";
-
-struct UploadJob {
-  uint8_t* data;
-  size_t len;
-};
-
-String currentJobAgeText() {
-  if (!jobRunning && !triggerPending) {
-    return "0";
-  }
-
-  uint32_t startedAt = lastJobStartedAt != 0 ? lastJobStartedAt : triggerAcceptedAt;
-  return String(millis() - startedAt);
-}
-
 // ============================================================
-//  Netzwerk-Diagnose
+//  Diagnose
 // ============================================================
 void printWiFiStatus() {
   Serial.printf("WLAN verbunden: SSID=%s RSSI=%d dBm Kanal=%d\n",
@@ -95,13 +69,13 @@ void printWiFiStatus() {
 }
 
 // ============================================================
-//  Kamera initialisieren
+//  Kamera
 // ============================================================
 bool initCamera() {
   camera_config_t config = {};
 
   config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer   = LEDC_TIMER_0;
+  config.ledc_timer = LEDC_TIMER_0;
 
   config.pin_d0 = Y2_GPIO_NUM;
   config.pin_d1 = Y3_GPIO_NUM;
@@ -116,30 +90,25 @@ bool initCamera() {
   config.pin_pclk = PCLK_GPIO_NUM;
   config.pin_vsync = VSYNC_GPIO_NUM;
   config.pin_href = HREF_GPIO_NUM;
-
   config.pin_sccb_sda = SIOD_GPIO_NUM;
   config.pin_sccb_scl = SIOC_GPIO_NUM;
-
   config.pin_pwdn = PWDN_GPIO_NUM;
   config.pin_reset = RESET_GPIO_NUM;
 
   config.xclk_freq_hz = 20000000;
   config.pixel_format = PIXFORMAT_JPEG;
-
   config.grab_mode = CAMERA_GRAB_LATEST;
-  config.fb_location = CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality = 15;
 
-  // Für Diagnose erstmal konservativ.
-  // Wenn stabil: wieder XGA/SXGA testen.
-  config.frame_size = FRAMESIZE_SVGA;
-  config.jpeg_quality = 15;   // größer = kleinere Datei / schlechtere Qualität
-  config.fb_count = 2;
-
-  if (!psramFound()) {
+  if (psramFound()) {
+    config.frame_size = FRAMESIZE_UXGA;
+    config.fb_location = CAMERA_FB_IN_PSRAM;
+    config.fb_count = 2;
+  } else {
     Serial.println("PSRAM nicht gefunden, verwende VGA/DRAM");
-    config.frame_size  = FRAMESIZE_VGA;
+    config.frame_size = FRAMESIZE_VGA;
     config.fb_location = CAMERA_FB_IN_DRAM;
-    config.fb_count    = 1;
+    config.fb_count = 1;
   }
 
   esp_err_t err = esp_camera_init(&config);
@@ -151,28 +120,102 @@ bool initCamera() {
   return true;
 }
 
+camera_fb_t* getFrameWithRetry() {
+  for (int attempt = 1; attempt <= 3; attempt++) {
+    camera_fb_t* stale = esp_camera_fb_get();
+    if (stale) {
+      esp_camera_fb_return(stale);
+      delay(30);
+    }
+
+    camera_fb_t* frame = esp_camera_fb_get();
+    if (frame) {
+      return frame;
+    }
+
+    Serial.printf("Aufnahme fehlgeschlagen, Versuch %d/3\n", attempt);
+    delay(250);
+  }
+
+  Serial.println("Kamera liefert keinen Frame, reinitialisiere");
+  esp_camera_deinit();
+  delay(300);
+
+  if (!initCamera()) {
+    Serial.println("Kamera-Reinit fehlgeschlagen");
+    return nullptr;
+  }
+
+  delay(500);
+  return esp_camera_fb_get();
+}
+
+int captureJpegCopy(uint8_t** outData, size_t* outLen) {
+  *outData = nullptr;
+  *outLen = 0;
+
+  camera_fb_t* frame = getFrameWithRetry();
+  if (!frame) {
+    Serial.println("Aufnahme fehlgeschlagen");
+    return -1;
+  }
+
+  uint8_t* copy = psramFound()
+                    ? (uint8_t*)ps_malloc(frame->len)
+                    : nullptr;
+
+  if (!copy) {
+    copy = (uint8_t*)heap_caps_malloc(frame->len, MALLOC_CAP_8BIT);
+  }
+
+  if (!copy) {
+    Serial.println("Speicher fuer Bildkopie fehlgeschlagen");
+    esp_camera_fb_return(frame);
+    return -6;
+  }
+
+  memcpy(copy, frame->buf, frame->len);
+  *outData = copy;
+  *outLen = frame->len;
+
+  Serial.printf("Bild: %u Bytes\n", (unsigned int)frame->len);
+  esp_camera_fb_return(frame);
+  return 0;
+}
+
 // ============================================================
-//  JPEG per rohem WiFiClient senden
-//  Rückgabe: HTTP-Statuscode der Antwort, oder <0 bei Fehler
+//  Upload
 // ============================================================
-int postJpegFixedLength(const uint8_t* data, size_t len) {
+int readHttpStatusCode(WiFiClient& client) {
+  String statusLine = client.readStringUntil('\n');
+  statusLine.trim();
+  Serial.printf("Antwort: %s\n", statusLine.c_str());
+
+  int firstSpace = statusLine.indexOf(' ');
+  if (firstSpace < 0) {
+    return -4;
+  }
+
+  int secondSpace = statusLine.indexOf(' ', firstSpace + 1);
+  String codeText = secondSpace > firstSpace
+                      ? statusLine.substring(firstSpace + 1, secondSpace)
+                      : statusLine.substring(firstSpace + 1);
+
+  int code = codeText.toInt();
+  return code > 0 ? code : -5;
+}
+
+int uploadJpeg(const uint8_t* data, size_t len) {
   WiFiClient client;
   client.setTimeout(10000);
 
-  jobPhase = "CONNECT";
   Serial.printf("HTTP Connect: %s:%u%s\n", targetHost, targetPort, targetPath);
-
   if (!client.connect(targetHost, targetPort)) {
     Serial.println("TCP-Verbindung fehlgeschlagen");
     return -2;
   }
 
   client.setNoDelay(true);
-
-  // ----------------------------------------------------------
-  // Header senden
-  // ----------------------------------------------------------
-  jobPhase = "SEND_HEADER";
   client.printf("POST %s HTTP/1.1\r\n", targetPath);
   client.printf("Host: %s:%u\r\n", targetHost, targetPort);
   client.print("Content-Type: image/jpeg\r\n");
@@ -183,52 +226,30 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
   client.print("Connection: close\r\n");
   client.print("\r\n");
 
-  Serial.println("Header gesendet, Body startet...");
-
-  // ----------------------------------------------------------
-  // Body senden
-  //
-  // Wichtig:
-  // Keine availableForWrite()-Vorprüfung.
-  // Die war sehr wahrscheinlich der Grund, warum 0 Body-Bytes ankamen.
-  // ----------------------------------------------------------
-  static const size_t txChunkSize = 1436;
-
+  const size_t chunkSize = 1436;
+  const uint8_t* cursor = data;
   size_t remaining = len;
-  const uint8_t* p = data;
-
-  const uint32_t startedAt = millis();
   uint32_t lastProgress = millis();
+  uint32_t startedAt = millis();
 
-  bool firstWriteLogged = false;
-
-  jobPhase = "SEND_BODY";
   while (remaining > 0) {
     if (!client.connected()) {
-      Serial.println("TCP getrennt während Upload");
       client.stop();
+      Serial.println("TCP getrennt waehrend Upload");
       return -7;
     }
 
-    size_t chunkSize = min(remaining, txChunkSize);
-
-    size_t written = client.write(p, chunkSize);
-
+    size_t written = client.write(cursor, min(remaining, chunkSize));
     if (written > 0) {
-      if (!firstWriteLogged) {
-        Serial.printf("Erster Body-Write: %u Bytes\n", (unsigned int)written);
-        firstWriteLogged = true;
-      }
-
-      p += written;
+      cursor += written;
       remaining -= written;
       lastProgress = millis();
       continue;
     }
 
     if (millis() - lastProgress > 15000) {
-      Serial.println("Upload-Stall - Abbruch");
       client.stop();
+      Serial.println("Upload-Stall - Abbruch");
       return -3;
     }
 
@@ -239,336 +260,38 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
                 millis() - startedAt,
                 (unsigned int)len);
 
-  // ----------------------------------------------------------
-  // Antwort lesen
-  // ----------------------------------------------------------
-  jobPhase = "READ_RESPONSE";
-  client.setTimeout(10000);
-
-  String statusLine;
-  uint32_t responseDeadline = millis() + 10000;
-  while (millis() < responseDeadline) {
-    while (client.available()) {
-      char c = (char)client.read();
-      if (c == '\n') {
-        responseDeadline = millis();
-        break;
-      }
-
-      if (c != '\r' && statusLine.length() < 120) {
-        statusLine += c;
-      }
-    }
-
-    if (statusLine.length() > 0 && millis() >= responseDeadline) {
-      break;
-    }
-
-    if (!client.connected() && !client.available()) {
-      break;
-    }
-
-    delay(1);
-  }
-
-  Serial.printf("Antwort: %s\n", statusLine.c_str());
-
-  int firstSpace = statusLine.indexOf(' ');
-  if (firstSpace < 0) {
-    client.stop();
-    return -4;
-  }
-
-  int secondSpace = statusLine.indexOf(' ', firstSpace + 1);
-
-  String codeText = secondSpace > firstSpace
-                      ? statusLine.substring(firstSpace + 1, secondSpace)
-                      : statusLine.substring(firstSpace + 1);
-
-  int code = codeText.toInt();
-
-  // Rest nur kurz und nicht-blockierend ausgeben. Manche Server halten die
-  // Verbindung trotz "Connection: close" noch offen; readStringUntil() wuerde
-  // hier sonst wiederholt bis zum Timeout blockieren.
-  uint32_t drainUntil = millis() + 500;
-  while (millis() < drainUntil) {
-    while (client.available()) {
-      char c = (char)client.read();
-      Serial.print(c);
-      drainUntil = millis() + 50;
-    }
-
-    if (!client.connected()) {
-      break;
-    }
-
-    delay(1);
-  }
-
+  int code = readHttpStatusCode(client);
   client.stop();
-
-  return code > 0 ? code : -5;
+  return code;
 }
 
 // ============================================================
-//  Foto aufnehmen, kopieren, Kamera freigeben
+//  WLAN / HTTP-Server
 // ============================================================
-int captureJpegCopy(uint8_t** outData, size_t* outLen) {
-  *outData = nullptr;
-  *outLen = 0;
-
-  jobPhase = "CAPTURE";
-  printWiFiStatus();
-
-  camera_fb_t* fb = nullptr;
-
-  for (int attempt = 1; attempt <= 3; attempt++) {
-    // Erstes evtl. altes Bild verwerfen.
-    fb = esp_camera_fb_get();
-    if (fb) {
-      esp_camera_fb_return(fb);
-      delay(30);
-    }
-
-    fb = esp_camera_fb_get();
-    if (fb) {
-      break;
-    }
-
-    Serial.printf("Aufnahme fehlgeschlagen, Versuch %d/3\n", attempt);
-    delay(250);
-  }
-
-  if (!fb) {
-    Serial.println("Kamera liefert keinen Frame, reinitialisiere");
-    esp_camera_deinit();
-    delay(300);
-
-    if (!initCamera()) {
-      Serial.println("Kamera-Reinit fehlgeschlagen");
-      return -1;
-    }
-
-    delay(500);
-    fb = esp_camera_fb_get();
-    if (!fb) {
-      Serial.println("Aufnahme nach Kamera-Reinit fehlgeschlagen");
-      return -1;
-    }
-  }
-
-  const size_t len = fb->len;
-  Serial.printf("Bild: %u Bytes\n", (unsigned int)len);
-
-  uint8_t* copy = nullptr;
-  if (psramFound()) {
-    copy = (uint8_t*)ps_malloc(len);
-  }
-  if (!copy) {
-    Serial.println("PSRAM-Kopie fehlgeschlagen, versuche internen Speicher");
-    copy = (uint8_t*)heap_caps_malloc(len, MALLOC_CAP_8BIT);
-  }
-  if (!copy) {
-    Serial.println("Speicher für Bildkopie fehlgeschlagen");
-    esp_camera_fb_return(fb);
-    return -6;
-  }
-
-  memcpy(copy, fb->buf, len);
-
-  // Kamera sofort freigeben.
-  esp_camera_fb_return(fb);
-
-  *outData = copy;
-  *outLen = len;
-
-  jobPhase = "CAPTURE_DONE";
-  return 0;
-}
-
-// ============================================================
-//  HTTP-Handler
-// ============================================================
-void handleTrigger() {
-  Serial.println("Trigger empfangen -> Foto");
-
-  if (triggerPending || jobRunning) {
-    String body = "BUSY: Foto-Job laeuft bereits\nphase=" + String(jobPhase) +
-                  "\nage_ms=" + currentJobAgeText() + "\n";
-    server.send(409, "text/plain", body);
-    return;
-  }
-
-  triggerPending = true;
-  triggerAcceptedAt = millis();
-  jobPhase = "PENDING";
-  server.send(202, "text/plain", "ACCEPTED: Foto-Job gestartet\n");
-}
-
-void handleStatus() {
-  String status;
-
-  if (jobRunning) {
-    status = "RUNNING";
-  } else if (triggerPending) {
-    status = "PENDING";
-  } else if (lastUploadCode == 0) {
-    status = "IDLE";
-  } else if (lastUploadCode >= 200 && lastUploadCode < 300) {
-    status = "OK";
-  } else {
-    status = "ERROR";
-  }
-
-  String body = "status=" + status +
-                "\nphase=" + String(jobPhase) +
-                "\nage_ms=" + currentJobAgeText() +
-                "\nlast_upload_code=" + String(lastUploadCode) +
-                "\nlast_started_ms=" + String(lastJobStartedAt) +
-                "\nlast_finished_ms=" + String(lastJobFinishedAt) +
-                "\n";
-
-  server.send(200, "text/plain", body);
-}
-
-void triggerJobTask(void* parameter) {
-  UploadJob* job = (UploadJob*)parameter;
-
-  Serial.println("HTTP POST mit fester Content-Length...");
-  int code = postJpegFixedLength(job->data, job->len);
-  Serial.printf("Upload-HTTP %d\n", code);
-  lastUploadCode = code;
-  lastJobFinishedAt = millis();
-
-  free(job->data);
-  free(job);
-
-  if (code >= 200 && code < 300) {
-    Serial.printf("Foto-Job OK (%d)\n", code);
-  } else {
-    Serial.printf("Foto-Job FEHLER (%d)\n", code);
-  }
-
-  jobTaskHandle = nullptr;
-  jobPhase = "IDLE";
-  jobRunning = false;
-  vTaskDelete(nullptr);
-}
-
-void runPendingTrigger() {
-  if (!triggerPending || jobRunning) {
-    return;
-  }
-
-  if (millis() - triggerAcceptedAt < 50) {
-    return;
-  }
-
-  triggerPending = false;
-  jobRunning = true;
-  lastJobStartedAt = millis();
-
-  uint8_t* imageData = nullptr;
-  size_t imageLen = 0;
-  int captureCode = captureJpegCopy(&imageData, &imageLen);
-
-  if (captureCode != 0) {
-    lastUploadCode = captureCode;
-    lastJobFinishedAt = millis();
-    jobPhase = "IDLE";
-    jobRunning = false;
-    Serial.printf("Foto-Job FEHLER (%d)\n", captureCode);
-    return;
-  }
-
-  UploadJob* job = (UploadJob*)malloc(sizeof(UploadJob));
-  if (!job) {
-    free(imageData);
-    lastUploadCode = -9;
-    lastJobFinishedAt = millis();
-    jobPhase = "IDLE";
-    jobRunning = false;
-    Serial.println("Speicher fuer Upload-Job fehlgeschlagen");
-    return;
-  }
-
-  job->data = imageData;
-  job->len = imageLen;
-
-  BaseType_t created = xTaskCreatePinnedToCore(
-    triggerJobTask,
-    "trigger-job",
-    8192,
-    job,
-    1,
-    &jobTaskHandle,
-    1
-  );
-
-  if (created != pdPASS) {
-    free(job->data);
-    free(job);
-    Serial.println("Foto-Job Task konnte nicht gestartet werden");
-    jobTaskHandle = nullptr;
-    jobPhase = "IDLE";
-    jobRunning = false;
-    lastUploadCode = -8;
-    lastJobFinishedAt = millis();
-  }
-}
-
-void handleRoot() {
-  server.send(200, "text/plain",
-              "ESP32-CAM bereit.\n"
-              "Foto ausloesen: GET /trigger\n"
-              "Status: GET /status\n");
-}
-
-void handleNotFound() {
-  server.send(404, "text/plain", "Not found\n");
-}
-
-// ============================================================
-//  Setup / Loop
-// ============================================================
-void setup() {
-  Serial.begin(115200);
-  delay(100);
-
-  Serial.println();
-  Serial.println("ESP32-CAM Upload Version 3");
-
-  if (!initCamera()) {
-    Serial.println("Kamera-Init fehlgeschlagen - Neustart in 5 s");
-    delay(5000);
-    ESP.restart();
-  }
-
-  WiFi.mode(WIFI_STA);
-  WiFi.persistent(false);
-
-  // WLAN-Stromsparen aus
-  WiFi.setSleep(false);
-  esp_wifi_set_ps(WIFI_PS_NONE);
-
-  // Maximale Sendeleistung
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  esp_wifi_set_max_tx_power(78);  // 19.5 dBm, Einheit: 0.25 dBm
-
-  bool bssidSet = false;
+bool hasTargetBssid() {
   for (int i = 0; i < 6; i++) {
     if (targetBssid[i] != 0) {
-      bssidSet = true;
-      break;
+      return true;
     }
   }
+
+  return false;
+}
+
+void connectWiFi() {
+  WiFi.mode(WIFI_STA);
+  WiFi.persistent(false);
+  WiFi.setSleep(false);
+  esp_wifi_set_ps(WIFI_PS_NONE);
+  WiFi.setTxPower(WIFI_POWER_19_5dBm);
+  esp_wifi_set_max_tx_power(78);
 
   Serial.print("WLAN verbinden");
 
-  if (bssidSet) {
-    WiFi.begin(ssid, password, 0, targetBssid);
+  if (hasTargetBssid()) {
+    WiFi.begin(wifiSsid, wifiPassword, 0, targetBssid);
   } else {
-    WiFi.begin(ssid, password);
+    WiFi.begin(wifiSsid, wifiPassword);
   }
 
   while (WiFi.status() != WL_CONNECTED) {
@@ -577,24 +300,66 @@ void setup() {
   }
 
   Serial.println();
-  Serial.printf("Bereit. Trigger-URL: http://%s/trigger\n",
-                WiFi.localIP().toString().c_str());
-
   printWiFiStatus();
+}
 
+void handleTrigger() {
+  Serial.println("Trigger empfangen");
+
+  uint8_t* image = nullptr;
+  size_t imageLen = 0;
+  int captureCode = captureJpegCopy(&image, &imageLen);
+
+  if (captureCode != 0) {
+    server.send(500, "text/plain", "FEHLER: Aufnahme fehlgeschlagen\n");
+    return;
+  }
+
+  int uploadCode = uploadJpeg(image, imageLen);
+  free(image);
+
+  if (uploadCode >= 200 && uploadCode < 300) {
+    server.send(200, "text/plain", "OK: Foto gesendet (" + String(uploadCode) + ")\n");
+  } else {
+    server.send(500, "text/plain", "FEHLER: Upload fehlgeschlagen (" + String(uploadCode) + ")\n");
+  }
+}
+
+void handleRoot() {
+  server.send(200, "text/plain",
+              "ESP32-CAM bereit.\n"
+              "Foto ausloesen: GET /trigger\n");
+}
+
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+
+  Serial.println();
+  Serial.println("ESP32-CAM Upload");
+
+  if (!initCamera()) {
+    Serial.println("Kamera-Init fehlgeschlagen - Neustart in 5 s");
+    delay(5000);
+    ESP.restart();
+  }
+
+  connectWiFi();
+
+  Serial.printf("Trigger-URL: http://%s/trigger\n",
+                WiFi.localIP().toString().c_str());
   Serial.printf("Ziel: %s:%u%s\n", targetHost, targetPort, targetPath);
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/trigger", HTTP_GET, handleTrigger);
-  server.on("/status", HTTP_GET, handleStatus);
-  server.onNotFound(handleNotFound);
+  server.onNotFound([]() {
+    server.send(404, "text/plain", "Not found\n");
+  });
 
   server.begin();
-
   Serial.println("HTTP-Server gestartet");
 }
 
 void loop() {
   server.handleClient();
-  runPendingTrigger();
 }
