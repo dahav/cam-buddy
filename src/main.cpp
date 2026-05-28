@@ -53,6 +53,12 @@ uint8_t targetBssid[6] = {0xEC, 0x6C, 0x9A, 0x3C, 0xA1, 0x92};
 
 WebServer server(80);
 
+bool triggerPending = false;
+bool jobRunning = false;
+int lastUploadCode = 0;
+uint32_t lastJobStartedAt = 0;
+uint32_t lastJobFinishedAt = 0;
+
 // ============================================================
 //  Netzwerk-Diagnose
 // ============================================================
@@ -310,19 +316,65 @@ int captureAndSend() {
 void handleTrigger() {
   Serial.println("Trigger empfangen -> Foto");
 
+  if (triggerPending || jobRunning) {
+    server.send(409, "text/plain", "BUSY: Foto-Job laeuft bereits\n");
+    return;
+  }
+
+  triggerPending = true;
+  server.send(202, "text/plain", "ACCEPTED: Foto-Job gestartet\n");
+}
+
+void handleStatus() {
+  String status;
+
+  if (jobRunning) {
+    status = "RUNNING";
+  } else if (triggerPending) {
+    status = "PENDING";
+  } else if (lastUploadCode == 0) {
+    status = "IDLE";
+  } else if (lastUploadCode >= 200 && lastUploadCode < 300) {
+    status = "OK";
+  } else {
+    status = "ERROR";
+  }
+
+  String body = "status=" + status +
+                "\nlast_upload_code=" + String(lastUploadCode) +
+                "\nlast_started_ms=" + String(lastJobStartedAt) +
+                "\nlast_finished_ms=" + String(lastJobFinishedAt) +
+                "\n";
+
+  server.send(200, "text/plain", body);
+}
+
+void runPendingTrigger() {
+  if (!triggerPending || jobRunning) {
+    return;
+  }
+
+  triggerPending = false;
+  jobRunning = true;
+  lastJobStartedAt = millis();
+
   int code = captureAndSend();
+  lastUploadCode = code;
+  lastJobFinishedAt = millis();
+  jobRunning = false;
 
   if (code >= 200 && code < 300) {
-    server.send(200, "text/plain", "OK: Foto gesendet (" + String(code) + ")\n");
+    Serial.printf("Foto-Job OK (%d)\n", code);
   } else {
-    server.send(500, "text/plain", "FEHLER beim Senden (Code " + String(code) + ")\n");
+    Serial.printf("Foto-Job FEHLER (%d)\n", code);
   }
 }
 
 void handleRoot() {
   server.send(200, "text/plain",
               "ESP32-CAM bereit.\n"
-              "Foto auslösen: GET /trigger\n");
+              "Foto ausloesen: GET /trigger\n"
+              "Status: GET /status\n");
 }
 
 void handleNotFound() {
@@ -387,6 +439,7 @@ void setup() {
 
   server.on("/", HTTP_GET, handleRoot);
   server.on("/trigger", HTTP_GET, handleTrigger);
+  server.on("/status", HTTP_GET, handleStatus);
   server.onNotFound(handleNotFound);
 
   server.begin();
@@ -396,4 +449,5 @@ void setup() {
 
 void loop() {
   server.handleClient();
+  runPendingTrigger();
 }
