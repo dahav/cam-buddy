@@ -1,342 +1,206 @@
 /*
- * ESP32-CAM - per HTTP getriggerter Foto-Upload
+ * ESP32-CAM  -  Snapshot zum Fokussieren
+ * ---------------------------------------
+ * Temporaere Firmware: bei jedem Browser-Reload wird genau ein JPEG
+ * aufgenommen und direkt ausgeliefert.
  *
- * GET /trigger:
- *   - nimmt ein Foto auf
- *   - sendet es per HTTP POST an den Zielserver
- *   - antwortet erst, wenn der Upload fertig ist
+ * Bedienung:
+ *   1. Flashen, RST druecken, seriellen Monitor oeffnen.
+ *   2. Angezeigte IP im Browser oeffnen:  http://<IP>/
+ *   3. Mit F5 ein neues Bild anfordern und am Objektiv drehen.
  */
 
 #include <Arduino.h>
 #include "esp_camera.h"
 #include <WiFi.h>
-#include <WebServer.h>
-#include "esp_heap_caps.h"
 #include "esp_wifi.h"
+#include "esp_http_server.h"
+#include "lwip/sockets.h"
 
-// ============================================================
-//  Konfiguration
-// ============================================================
-const char* wifiSsid = "DIBO13";
-const char* wifiPassword = "b82@qPSt";
+// ===== ANPASSEN =====
+const char* ssid     = "DIBO13";
+const char* password = "b82@qPSt";
 
-const char* targetHost = "192.168.0.10";
-const uint16_t targetPort = 8001;
-const char* targetPath = "/solve/togaf";
-const char* apiKey = "1234567";
+const framesize_t cameraFrameSize = FRAMESIZE_XGA; // hoeher = mehr Details, aber laengerer Capture-Zeit
+const int cameraJpegQuality = 10;                   // niedriger = bessere Qualitaet (10..63)
+const uint32_t cameraXclkHz = 20000000;             // 20 MHz: schnelle Zeilenauslese, weniger Rolling-Shutter
+const wifi_power_t wifiTxPower = WIFI_POWER_8_5dBm; // nah am AP: weniger Retransmits
 
-// Auf {0,0,0,0,0,0} setzen, um den Access Point automatisch zu waehlen.
-uint8_t targetBssid[6] = {0xEC, 0x6C, 0x9A, 0x3C, 0xA1, 0x92};
+// ===== Kamera-Pinbelegung AI-Thinker ESP32-CAM =====
+#define PWDN_GPIO_NUM   32
+#define RESET_GPIO_NUM  -1
+#define XCLK_GPIO_NUM    0
+#define SIOD_GPIO_NUM   26
+#define SIOC_GPIO_NUM   27
+#define Y9_GPIO_NUM     35
+#define Y8_GPIO_NUM     34
+#define Y7_GPIO_NUM     39
+#define Y6_GPIO_NUM     36
+#define Y5_GPIO_NUM     21
+#define Y4_GPIO_NUM     19
+#define Y3_GPIO_NUM     18
+#define Y2_GPIO_NUM      5
+#define VSYNC_GPIO_NUM  25
+#define HREF_GPIO_NUM   23
+#define PCLK_GPIO_NUM   22
 
-// ============================================================
-//  AI-Thinker ESP32-CAM Pins
-// ============================================================
-#define PWDN_GPIO_NUM     32
-#define RESET_GPIO_NUM    -1
-#define XCLK_GPIO_NUM      0
-#define SIOD_GPIO_NUM     26
-#define SIOC_GPIO_NUM     27
-#define Y9_GPIO_NUM       35
-#define Y8_GPIO_NUM       34
-#define Y7_GPIO_NUM       39
-#define Y6_GPIO_NUM       36
-#define Y5_GPIO_NUM       21
-#define Y4_GPIO_NUM       19
-#define Y3_GPIO_NUM       18
-#define Y2_GPIO_NUM        5
-#define VSYNC_GPIO_NUM    25
-#define HREF_GPIO_NUM     23
-#define PCLK_GPIO_NUM     22
+httpd_handle_t cameraHttpd = NULL;
 
-WebServer server(80);
-
-// ============================================================
-//  Diagnose
-// ============================================================
-void printWiFiStatus() {
-  Serial.printf("WLAN verbunden: SSID=%s RSSI=%d dBm Kanal=%d\n",
-                WiFi.SSID().c_str(), WiFi.RSSI(), WiFi.channel());
-
-  Serial.printf("IP=%s Gateway=%s Subnet=%s DNS=%s\n",
-                WiFi.localIP().toString().c_str(),
-                WiFi.gatewayIP().toString().c_str(),
-                WiFi.subnetMask().toString().c_str(),
-                WiFi.dnsIP().toString().c_str());
-
-  Serial.printf("MAC=%s BSSID=%s\n",
-                WiFi.macAddress().c_str(),
-                WiFi.BSSIDstr().c_str());
-}
-
-// ============================================================
-//  Kamera
-// ============================================================
 bool initCamera() {
   camera_config_t config = {};
-
   config.ledc_channel = LEDC_CHANNEL_0;
-  config.ledc_timer = LEDC_TIMER_0;
-
-  config.pin_d0 = Y2_GPIO_NUM;
-  config.pin_d1 = Y3_GPIO_NUM;
-  config.pin_d2 = Y4_GPIO_NUM;
-  config.pin_d3 = Y5_GPIO_NUM;
-  config.pin_d4 = Y6_GPIO_NUM;
-  config.pin_d5 = Y7_GPIO_NUM;
-  config.pin_d6 = Y8_GPIO_NUM;
-  config.pin_d7 = Y9_GPIO_NUM;
-
-  config.pin_xclk = XCLK_GPIO_NUM;
-  config.pin_pclk = PCLK_GPIO_NUM;
-  config.pin_vsync = VSYNC_GPIO_NUM;
-  config.pin_href = HREF_GPIO_NUM;
-  config.pin_sccb_sda = SIOD_GPIO_NUM;
-  config.pin_sccb_scl = SIOC_GPIO_NUM;
-  config.pin_pwdn = PWDN_GPIO_NUM;
-  config.pin_reset = RESET_GPIO_NUM;
-
-  config.xclk_freq_hz = 20000000;
-  config.pixel_format = PIXFORMAT_JPEG;
-  config.grab_mode = CAMERA_GRAB_LATEST;
-  config.jpeg_quality = 15;
-
-  if (psramFound()) {
-    config.frame_size = FRAMESIZE_UXGA;
-    config.fb_location = CAMERA_FB_IN_PSRAM;
-    config.fb_count = 2;
-  } else {
-    Serial.println("PSRAM nicht gefunden, verwende VGA/DRAM");
-    config.frame_size = FRAMESIZE_VGA;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0=Y2_GPIO_NUM; config.pin_d1=Y3_GPIO_NUM;
+  config.pin_d2=Y4_GPIO_NUM; config.pin_d3=Y5_GPIO_NUM;
+  config.pin_d4=Y6_GPIO_NUM; config.pin_d5=Y7_GPIO_NUM;
+  config.pin_d6=Y8_GPIO_NUM; config.pin_d7=Y9_GPIO_NUM;
+  config.pin_xclk=XCLK_GPIO_NUM; config.pin_pclk=PCLK_GPIO_NUM;
+  config.pin_vsync=VSYNC_GPIO_NUM; config.pin_href=HREF_GPIO_NUM;
+  config.pin_sccb_sda=SIOD_GPIO_NUM; config.pin_sccb_scl=SIOC_GPIO_NUM;
+  config.pin_pwdn=PWDN_GPIO_NUM; config.pin_reset=RESET_GPIO_NUM;
+  config.xclk_freq_hz=cameraXclkHz;
+  config.pixel_format=PIXFORMAT_JPEG;
+  // LATEST + fb_count=2: Treiber ueberschreibt staendig den aelteren Puffer,
+  // sodass fb_get() immer den juengsten fertigen Frame liefert.
+  config.grab_mode=CAMERA_GRAB_LATEST;
+  config.fb_location=CAMERA_FB_IN_PSRAM;
+  config.jpeg_quality=cameraJpegQuality;
+  config.fb_count=2;
+  config.frame_size=cameraFrameSize;
+  if (!psramFound()) {
+    config.frame_size  = FRAMESIZE_QVGA;
     config.fb_location = CAMERA_FB_IN_DRAM;
-    config.fb_count = 1;
+    config.fb_count    = 1;
+    config.grab_mode   = CAMERA_GRAB_WHEN_EMPTY;
   }
-
   esp_err_t err = esp_camera_init(&config);
   if (err != ESP_OK) {
     Serial.printf("Kamera-Init Fehler: 0x%x\n", err);
     return false;
   }
 
+  sensor_t* s = esp_camera_sensor_get();
+  if (s) {
+    s->set_framesize(s, config.frame_size);
+    s->set_quality(s, cameraJpegQuality);
+    s->set_brightness(s, 0);
+    s->set_contrast(s, 0);
+    s->set_saturation(s, 0);
+    s->set_sharpness(s, 2);          // schaerfere Kanten fuer Fokus-Beurteilung
+    s->set_denoise(s, 0);
+    s->set_whitebal(s, 1);
+    s->set_awb_gain(s, 1);
+    s->set_wb_mode(s, 0);            // 0 = auto
+    s->set_exposure_ctrl(s, 1);
+    s->set_aec2(s, 1);               // bessere Auto-Belichtung
+    s->set_ae_level(s, 0);
+    s->set_gain_ctrl(s, 1);
+    s->set_agc_gain(s, 0);
+    s->set_gainceiling(s, GAINCEILING_8X); // mehr Gain -> kuerzere Belichtung -> weniger Bewegungsunschaerfe
+    s->set_bpc(s, 1);
+    s->set_wpc(s, 1);
+    s->set_raw_gma(s, 1);
+    s->set_lenc(s, 1);
+    s->set_hmirror(s, 0);
+    s->set_vflip(s, 0);
+    s->set_dcw(s, 1);
+    s->set_colorbar(s, 0);
+    s->set_special_effect(s, 2);     // 2 = B&W: spart ~30-40 % JPEG-Groesse (Chroma weg)
+  }
+
+  // Mehrere Warmup-Frames: AEC/AGC braucht ein paar Frames bis Belichtung stabil.
+  for (int i = 0; i < 4; ++i) {
+    camera_fb_t* warmup = esp_camera_fb_get();
+    if (warmup) esp_camera_fb_return(warmup);
+  }
   return true;
 }
 
-camera_fb_t* getFrameWithRetry() {
-  for (int attempt = 1; attempt <= 3; attempt++) {
-    camera_fb_t* stale = esp_camera_fb_get();
-    if (stale) {
-      esp_camera_fb_return(stale);
-      delay(30);
-    }
+// ---- Ein Bild pro Request ----
+static esp_err_t snapshotHandler(httpd_req_t* req) {
+  uint32_t requestStartedAt = millis();
+  Serial.println("Snapshot angefragt");
 
-    camera_fb_t* frame = esp_camera_fb_get();
-    if (frame) {
-      return frame;
-    }
-
-    Serial.printf("Aufnahme fehlgeschlagen, Versuch %d/3\n", attempt);
-    delay(250);
+  uint32_t captureStartedAt = millis();
+  // Alten/halb-gefuellten Frame verwerfen, dann den naechsten frisch
+  // belichteten Frame zurueckgeben. Garantiert: Bild entstand NACH dem Request.
+  camera_fb_t* stale = esp_camera_fb_get();
+  if (stale) esp_camera_fb_return(stale);
+  camera_fb_t* fb = esp_camera_fb_get();
+  uint32_t captureMs = millis() - captureStartedAt;
+  if (!fb) {
+    Serial.println("Kamera liefert kein Bild");
+    httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Kamera liefert kein Bild");
+    return ESP_FAIL;
   }
 
-  Serial.println("Kamera liefert keinen Frame, reinitialisiere");
-  esp_camera_deinit();
-  delay(300);
+  char header[256];
+  int headerLen = snprintf(header, sizeof(header),
+                           "HTTP/1.1 200 OK\r\n"
+                           "Content-Type: image/jpeg\r\n"
+                           "Content-Length: %u\r\n"
+                           "Cache-Control: no-store, no-cache, must-revalidate, max-age=0\r\n"
+                           "Pragma: no-cache\r\n"
+                           "Expires: 0\r\n"
+                           "Connection: close\r\n"
+                           "\r\n",
+                           (unsigned int)fb->len);
 
-  if (!initCamera()) {
-    Serial.println("Kamera-Reinit fehlgeschlagen");
-    return nullptr;
+  uint32_t sendStartedAt = millis();
+  esp_err_t res = ESP_OK;
+  int headerWritten = httpd_send(req, header, headerLen);
+  int bodyWritten = headerWritten == headerLen
+                      ? httpd_send(req, (const char*)fb->buf, fb->len)
+                      : -1;
+  if (bodyWritten != (int)fb->len) {
+    res = ESP_FAIL;
   }
+  uint32_t sendMs = millis() - sendStartedAt;
+  uint32_t totalMs = millis() - requestStartedAt;
+  Serial.printf("Snapshot: %d/%u Bytes capture=%lu ms send=%lu ms total=%lu ms RSSI=%d dBm res=%d\n",
+                bodyWritten,
+                (unsigned int)fb->len,
+                (unsigned long)captureMs,
+                (unsigned long)sendMs,
+                (unsigned long)totalMs,
+                WiFi.RSSI(),
+                (int)res);
 
-  delay(500);
-  return esp_camera_fb_get();
+  esp_camera_fb_return(fb);
+  return res;
 }
 
-int captureJpegCopy(uint8_t** outData, size_t* outLen) {
-  *outData = nullptr;
-  *outLen = 0;
-
-  camera_fb_t* frame = getFrameWithRetry();
-  if (!frame) {
-    Serial.println("Aufnahme fehlgeschlagen");
-    return -1;
-  }
-
-  uint8_t* copy = psramFound()
-                    ? (uint8_t*)ps_malloc(frame->len)
-                    : nullptr;
-
-  if (!copy) {
-    copy = (uint8_t*)heap_caps_malloc(frame->len, MALLOC_CAP_8BIT);
-  }
-
-  if (!copy) {
-    Serial.println("Speicher fuer Bildkopie fehlgeschlagen");
-    esp_camera_fb_return(frame);
-    return -6;
-  }
-
-  memcpy(copy, frame->buf, frame->len);
-  *outData = copy;
-  *outLen = frame->len;
-
-  Serial.printf("Bild: %u Bytes\n", (unsigned int)frame->len);
-  esp_camera_fb_return(frame);
-  return 0;
+static esp_err_t openHttpSession(httpd_handle_t hd, int sockfd) {
+  (void)hd;
+  int yes = 1;
+  setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+  return ESP_OK;
 }
 
-// ============================================================
-//  Upload
-// ============================================================
-int readHttpStatusCode(WiFiClient& client) {
-  String statusLine = client.readStringUntil('\n');
-  statusLine.trim();
-  Serial.printf("Antwort: %s\n", statusLine.c_str());
-
-  int firstSpace = statusLine.indexOf(' ');
-  if (firstSpace < 0) {
-    return -4;
-  }
-
-  int secondSpace = statusLine.indexOf(' ', firstSpace + 1);
-  String codeText = secondSpace > firstSpace
-                      ? statusLine.substring(firstSpace + 1, secondSpace)
-                      : statusLine.substring(firstSpace + 1);
-
-  int code = codeText.toInt();
-  return code > 0 ? code : -5;
+static esp_err_t faviconHandler(httpd_req_t* req) {
+  httpd_resp_set_status(req, "204 No Content");
+  return httpd_resp_send(req, NULL, 0);
 }
 
-int uploadJpeg(const uint8_t* data, size_t len) {
-  WiFiClient client;
-  client.setTimeout(10000);
+void startServer() {
+  httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+  config.server_port = 80;
+  config.lru_purge_enable = true;
+  config.open_fn = openHttpSession;
 
-  Serial.printf("HTTP Connect: %s:%u%s\n", targetHost, targetPort, targetPath);
-  if (!client.connect(targetHost, targetPort)) {
-    Serial.println("TCP-Verbindung fehlgeschlagen");
-    return -2;
+  httpd_uri_t snapshotUri = { "/", HTTP_GET, snapshotHandler, NULL };
+  httpd_uri_t faviconUri = { "/favicon.ico", HTTP_GET, faviconHandler, NULL };
+
+  if (httpd_start(&cameraHttpd, &config) == ESP_OK) {
+    httpd_register_uri_handler(cameraHttpd, &snapshotUri);
+    httpd_register_uri_handler(cameraHttpd, &faviconUri);
   }
-
-  client.setNoDelay(true);
-  client.printf("POST %s HTTP/1.1\r\n", targetPath);
-  client.printf("Host: %s:%u\r\n", targetHost, targetPort);
-  client.print("Content-Type: image/jpeg\r\n");
-  client.print("Accept: application/json\r\n");
-  client.printf("X-API-Key: %s\r\n", apiKey);
-  client.printf("X-Filename: esp32cam_%lu.jpg\r\n", millis());
-  client.printf("Content-Length: %u\r\n", (unsigned int)len);
-  client.print("Connection: close\r\n");
-  client.print("\r\n");
-
-  const size_t chunkSize = 1436;
-  const uint8_t* cursor = data;
-  size_t remaining = len;
-  uint32_t lastProgress = millis();
-  uint32_t startedAt = millis();
-
-  while (remaining > 0) {
-    if (!client.connected()) {
-      client.stop();
-      Serial.println("TCP getrennt waehrend Upload");
-      return -7;
-    }
-
-    size_t written = client.write(cursor, min(remaining, chunkSize));
-    if (written > 0) {
-      cursor += written;
-      remaining -= written;
-      lastProgress = millis();
-      continue;
-    }
-
-    if (millis() - lastProgress > 15000) {
-      client.stop();
-      Serial.println("Upload-Stall - Abbruch");
-      return -3;
-    }
-
-    delay(1);
-  }
-
-  Serial.printf("Upload gesendet in %lu ms (%u Bytes)\n",
-                millis() - startedAt,
-                (unsigned int)len);
-
-  int code = readHttpStatusCode(client);
-  client.stop();
-  return code;
-}
-
-// ============================================================
-//  WLAN / HTTP-Server
-// ============================================================
-bool hasTargetBssid() {
-  for (int i = 0; i < 6; i++) {
-    if (targetBssid[i] != 0) {
-      return true;
-    }
-  }
-
-  return false;
-}
-
-void connectWiFi() {
-  WiFi.mode(WIFI_STA);
-  WiFi.persistent(false);
-  WiFi.setSleep(false);
-  esp_wifi_set_ps(WIFI_PS_NONE);
-  WiFi.setTxPower(WIFI_POWER_19_5dBm);
-  esp_wifi_set_max_tx_power(78);
-
-  Serial.print("WLAN verbinden");
-
-  if (hasTargetBssid()) {
-    WiFi.begin(wifiSsid, wifiPassword, 0, targetBssid);
-  } else {
-    WiFi.begin(wifiSsid, wifiPassword);
-  }
-
-  while (WiFi.status() != WL_CONNECTED) {
-    delay(300);
-    Serial.print(".");
-  }
-
-  Serial.println();
-  printWiFiStatus();
-}
-
-void handleTrigger() {
-  Serial.println("Trigger empfangen");
-
-  uint8_t* image = nullptr;
-  size_t imageLen = 0;
-  int captureCode = captureJpegCopy(&image, &imageLen);
-
-  if (captureCode != 0) {
-    server.send(500, "text/plain", "FEHLER: Aufnahme fehlgeschlagen\n");
-    return;
-  }
-
-  int uploadCode = uploadJpeg(image, imageLen);
-  free(image);
-
-  if (uploadCode >= 200 && uploadCode < 300) {
-    server.send(200, "text/plain", "OK: Foto gesendet (" + String(uploadCode) + ")\n");
-  } else {
-    server.send(500, "text/plain", "FEHLER: Upload fehlgeschlagen (" + String(uploadCode) + ")\n");
-  }
-}
-
-void handleRoot() {
-  server.send(200, "text/plain",
-              "ESP32-CAM bereit.\n"
-              "Foto ausloesen: GET /trigger\n");
 }
 
 void setup() {
   Serial.begin(115200);
-  delay(100);
-
-  Serial.println();
-  Serial.println("ESP32-CAM Upload");
+  delay(50);
+  Serial.println("\n=== ESP32-CAM Snapshot (Fokus) ===");
 
   if (!initCamera()) {
     Serial.println("Kamera-Init fehlgeschlagen - Neustart in 5 s");
@@ -344,22 +208,23 @@ void setup() {
     ESP.restart();
   }
 
-  connectWiFi();
+  WiFi.mode(WIFI_STA);
+  WiFi.setSleep(false);
+  WiFi.setTxPower(wifiTxPower);
 
-  Serial.printf("Trigger-URL: http://%s/trigger\n",
+  WiFi.begin(ssid, password);
+
+  Serial.print("WLAN");
+  while (WiFi.status() != WL_CONNECTED) { delay(300); Serial.print("."); }
+  Serial.println();
+
+  startServer();
+
+  Serial.printf("Snapshot bereit: http://%s/  (F5 erzeugt neues Bild)\n",
                 WiFi.localIP().toString().c_str());
-  Serial.printf("Ziel: %s:%u%s\n", targetHost, targetPort, targetPath);
-
-  server.on("/", HTTP_GET, handleRoot);
-  server.on("/trigger", HTTP_GET, handleTrigger);
-  server.onNotFound([]() {
-    server.send(404, "text/plain", "Not found\n");
-  });
-
-  server.begin();
-  Serial.println("HTTP-Server gestartet");
+  Serial.printf("SSID=%s RSSI=%d dBm\n", WiFi.SSID().c_str(), WiFi.RSSI());
 }
 
 void loop() {
-  server.handleClient();
+  delay(1000);   // Arbeit laeuft im HTTP-Server-Task
 }
