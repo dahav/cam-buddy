@@ -1,4 +1,4 @@
-ENV ?= esp32cam
+ENV ?= test_webserver
 PIO ?= pio
 
 .PHONY: all build flash monitor
