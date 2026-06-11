@@ -3,13 +3,6 @@
 #include <Arduino.h>
 #include "esp_camera.h"
 
-#define CAM_OV2640 1
-#define CAM_OV3660 2
-
-#ifndef SELECTED_CAM
-#define SELECTED_CAM CAM_OV3660
-#endif
-
 struct CamProfile {
   const char* name;
   framesize_t frame_size;
@@ -19,6 +12,26 @@ struct CamProfile {
   bool vflip;
   bool hmirror;
   int expected_pid;
+  int exposure_ctrl;
+  int aec2;
+  int ae_level;
+  int aec_value;
+  int gain_ctrl;
+  int agc_gain;
+  gainceiling_t gain_ceiling;
+  int whitebal;
+  int awb_gain;
+  int wb_mode;
+  int brightness;
+  int contrast;
+  int saturation;
+  int sharpness;
+  int denoise;
+  int dcw;
+  int bpc;
+  int wpc;
+  int raw_gma;
+  int lenc;
 };
 
 struct CapturedJpeg {
@@ -29,5 +42,7 @@ struct CapturedJpeg {
 extern const CamProfile camProfile;
 
 bool initCamera();
+void cameraSleep();
+void cameraWake();
 int captureJpegCopy(CapturedJpeg* image);
 void freeCapturedJpeg(CapturedJpeg* image);

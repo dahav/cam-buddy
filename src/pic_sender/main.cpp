@@ -8,14 +8,16 @@
 #include <Arduino.h>
 #include "../shared/camera_shared.h"
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <WebServer.h>
 #include "../shared/wifi_shared.h"
 
 namespace {
 
-const char* targetHost = "192.168.1.100";
-const uint16_t targetPort = 8001;
-const char* targetPath = "/upload.php";
-const char* apiKey = "";
+const char* targetHost = "haverkamp-engineering.de";
+const uint16_t targetPort = 443;
+const char* targetPath = "/quiz/solve/togaf";
+const char* apiKey = "5e58dce9bdd6";
 
 constexpr int kButtonPin = 13;
 constexpr uint32_t kDebounceMs = 50;
@@ -27,6 +29,13 @@ uint32_t lastDebounceAt = 0;
 uint32_t lastTriggerAt = 0;
 bool jobRunning = false;
 int lastUploadCode = 0;
+bool httpTriggerPending = false;
+
+}  // namespace
+
+WebServer httpServer(80);
+
+namespace {
 
 bool buttonPressedEvent() {
   const bool reading = digitalRead(kButtonPin);
@@ -102,11 +111,12 @@ int readHttpStatusCode(WiFiClient* client) {
 }
 
 void drainHttpResponse(WiFiClient* client) {
-  uint32_t drainUntil = millis() + 500;
+  Serial.println("--- Server Response ---");
+  uint32_t drainUntil = millis() + 5000;
   while (millis() < drainUntil) {
     while (client->available()) {
       Serial.print((char)client->read());
-      drainUntil = millis() + 50;
+      drainUntil = millis() + 200;
     }
 
     if (!client->connected()) {
@@ -115,6 +125,7 @@ void drainHttpResponse(WiFiClient* client) {
 
     delay(1);
   }
+  Serial.println("\n--- Ende Response ---");
 }
 
 int postJpegFixedLength(const uint8_t* data, size_t len) {
@@ -122,19 +133,22 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
     return -11;
   }
 
-  WiFiClient client;
-  client.setTimeout(10000);
+  WiFiClientSecure client;
+  client.setInsecure();  // TLS ohne Zertifikatspruefung
+  client.setTimeout(10);  // 10 Sekunden Timeout fuer read/write
+  client.setHandshakeTimeout(10);  // 10 Sekunden TLS-Handshake
 
-  Serial.printf("HTTP Connect: %s:%u%s\n", targetHost, targetPort, targetPath);
+  Serial.printf("HTTPS Connect: %s:%u%s\n", targetHost, targetPort, targetPath);
   if (!client.connect(targetHost, targetPort)) {
-    Serial.println("TCP-Verbindung fehlgeschlagen");
+    Serial.println("TLS-Verbindung fehlgeschlagen");
     return -2;
   }
 
+  Serial.println("TLS-Handshake OK");
   client.setNoDelay(true);
 
   client.printf("POST %s HTTP/1.1\r\n", targetPath);
-  client.printf("Host: %s:%u\r\n", targetHost, targetPort);
+  client.printf("Host: %s\r\n", targetHost);
   client.print("Content-Type: image/jpeg\r\n");
   client.print("Accept: application/json\r\n");
   if (apiKey[0] != '\0') {
@@ -188,6 +202,14 @@ int postJpegFixedLength(const uint8_t* data, size_t len) {
   Serial.printf("Upload gesendet in %lu ms (%u Bytes)\n",
                 millis() - startedAt,
                 (unsigned int)len);
+
+  client.flush();
+
+  // Warte bis Antwortdaten eintreffen (max 10s)
+  uint32_t waitStart = millis();
+  while (!client.available() && client.connected() && millis() - waitStart < 10000) {
+    delay(10);
+  }
 
   int code = readHttpStatusCode(&client);
   drainHttpResponse(&client);
@@ -267,11 +289,27 @@ void setup() {
 
   printWifiStatus();
   Serial.printf("Ziel: %s:%u%s\n", targetHost, targetPort, targetPath);
+
+  httpServer.on("/trigger", HTTP_GET, []() {
+    if (jobRunning) {
+      httpServer.send(429, "text/plain", "BUSY: Job laeuft bereits");
+      return;
+    }
+    httpTriggerPending = true;
+    httpServer.send(200, "text/plain", "OK: Trigger angenommen");
+  });
+
+  httpServer.begin();
+  Serial.println("HTTP-Server gestartet auf Port 80 (/trigger)");
+
   Serial.printf("Bereit. Letzter Upload-Code: %d\n", lastUploadCode);
 }
 
 void loop() {
-  if (buttonPressedEvent()) {
+  httpServer.handleClient();
+
+  if (buttonPressedEvent() || httpTriggerPending) {
+    httpTriggerPending = false;
     runButtonJob();
   }
 

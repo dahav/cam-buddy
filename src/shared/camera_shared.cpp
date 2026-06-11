@@ -2,34 +2,36 @@
 
 #include "esp_heap_caps.h"
 
-#define OV2640_PID 0x26
-#define OV3660_PID 0x3660
-
-#if SELECTED_CAM == CAM_OV2640
 const CamProfile camProfile = {
-  /* name         */ "OV2640",
-  /* frame_size   */ FRAMESIZE_SVGA,
-  /* jpeg_quality */ 12,
-  /* xclk_hz      */ 20000000,
-  /* fb_count     */ 2,
-  /* vflip        */ false,
-  /* hmirror      */ false,
-  /* expected_pid */ OV2640_PID
+  /* name          */ "OV5640",
+  /* frame_size    */ FRAMESIZE_FHD,
+  /* jpeg_quality  */ 10,
+  /* xclk_hz       */ 12000000,
+  /* fb_count      */ 1,
+  /* vflip         */ false,
+  /* hmirror       */ true,
+  /* expected_pid  */ OV5640_PID,
+  /* exposure_ctrl */ 0,
+  /* aec2          */ 0,
+  /* ae_level      */ 0,
+  /* aec_value     */ 22,
+  /* gain_ctrl     */ 0,
+  /* agc_gain      */ 6,
+  /* gain_ceiling  */ GAINCEILING_8X,
+  /* whitebal      */ 1,
+  /* awb_gain      */ 1,
+  /* wb_mode       */ 1,
+  /* brightness    */ 0,
+  /* contrast      */ 2,
+  /* saturation    */ -2,
+  /* sharpness     */ 2,
+  /* denoise       */ 1,
+  /* dcw           */ 1,
+  /* bpc           */ 1,
+  /* wpc           */ 1,
+  /* raw_gma       */ 1,
+  /* lenc          */ 1
 };
-#elif SELECTED_CAM == CAM_OV3660
-const CamProfile camProfile = {
-  /* name         */ "OV3660",
-  /* frame_size   */ FRAMESIZE_QXGA,
-  /* jpeg_quality */ 12,
-  /* xclk_hz      */ 20000000,
-  /* fb_count     */ 2,
-  /* vflip        */ true,
-  /* hmirror      */ false,
-  /* expected_pid */ OV3660_PID
-};
-#else
-#error "SELECTED_CAM ungueltig - CAM_OV2640 oder CAM_OV3660 waehlen"
-#endif
 
 namespace {
 
@@ -72,7 +74,52 @@ void configureCameraPins(camera_config_t* config) {
   config->pin_reset = RESET_GPIO_NUM;
 }
 
+void applySensorTuning(sensor_t* sensor) {
+  sensor->set_vflip(sensor, camProfile.vflip ? 1 : 0);
+  sensor->set_hmirror(sensor, camProfile.hmirror ? 1 : 0);
+
+  sensor->set_colorbar(sensor, 0);
+  sensor->set_special_effect(sensor, 0);
+  sensor->set_brightness(sensor, camProfile.brightness);
+  sensor->set_contrast(sensor, camProfile.contrast);
+  sensor->set_saturation(sensor, camProfile.saturation);
+  sensor->set_sharpness(sensor, camProfile.sharpness);
+  sensor->set_denoise(sensor, camProfile.denoise);
+
+  sensor->set_exposure_ctrl(sensor, camProfile.exposure_ctrl);
+  sensor->set_aec2(sensor, camProfile.aec2);
+  sensor->set_ae_level(sensor, camProfile.ae_level);
+  sensor->set_aec_value(sensor, camProfile.aec_value);
+
+  sensor->set_gain_ctrl(sensor, camProfile.gain_ctrl);
+  sensor->set_agc_gain(sensor, camProfile.agc_gain);
+  sensor->set_gainceiling(sensor, camProfile.gain_ceiling);
+
+  sensor->set_whitebal(sensor, camProfile.whitebal);
+  sensor->set_awb_gain(sensor, camProfile.awb_gain);
+  sensor->set_wb_mode(sensor, camProfile.wb_mode);
+
+  sensor->set_dcw(sensor, camProfile.dcw);
+  sensor->set_bpc(sensor, camProfile.bpc);
+  sensor->set_wpc(sensor, camProfile.wpc);
+  sensor->set_raw_gma(sensor, camProfile.raw_gma);
+  sensor->set_lenc(sensor, camProfile.lenc);
+}
+
 }  // namespace
+
+void cameraSleep() {
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, HIGH);
+  Serial.println("Kamera -> Sleep (PWDN HIGH)");
+}
+
+void cameraWake() {
+  pinMode(PWDN_GPIO_NUM, OUTPUT);
+  digitalWrite(PWDN_GPIO_NUM, LOW);
+  delay(50);  // Sensor braucht kurz zum Aufwachen
+  Serial.println("Kamera -> Wake (PWDN LOW)");
+}
 
 bool initCamera() {
   camera_config_t config = {};
@@ -85,7 +132,7 @@ bool initCamera() {
   config.frame_size = camProfile.frame_size;
   config.jpeg_quality = camProfile.jpeg_quality;
   config.fb_count = camProfile.fb_count;
-  config.grab_mode = CAMERA_GRAB_LATEST;
+  config.grab_mode = CAMERA_GRAB_WHEN_EMPTY;
   config.fb_location = CAMERA_FB_IN_PSRAM;
 
   if (!psramFound()) {
@@ -113,15 +160,21 @@ bool initCamera() {
   if (sensor->id.PID != camProfile.expected_pid) {
     Serial.printf("WARNUNG: Profil %s gewaehlt, aber Sensor-PID 0x%x erkannt!\n",
                   camProfile.name, sensor->id.PID);
-    Serial.println("  -> SELECTED_CAM passt nicht zum Modul. Trotzdem weiter.");
+    Serial.println("  -> Erwartet wird ein OV5640-Modul. Trotzdem weiter.");
   }
 
-  sensor->set_vflip(sensor, camProfile.vflip ? 1 : 0);
-  sensor->set_hmirror(sensor, camProfile.hmirror ? 1 : 0);
-  sensor->set_sharpness(sensor, 2);
-  sensor->set_exposure_ctrl(sensor, 0);
-  sensor->set_aec_value(sensor, 60);
-  sensor->set_gainceiling(sensor, GAINCEILING_16X);
+  applySensorTuning(sensor);
+  Serial.printf("OCR-Tuning: frame=%d quality=%d xclk=%lu fb=%d aec=%d agc=%d wb=%d\n",
+                (int)camProfile.frame_size,
+                camProfile.jpeg_quality,
+                (unsigned long)camProfile.xclk_hz,
+                camProfile.fb_count,
+                camProfile.aec_value,
+                camProfile.agc_gain,
+                camProfile.wb_mode);
+
+  // Kamera sofort in Standby schicken um Hitze zu vermeiden
+  cameraSleep();
 
   return true;
 }
@@ -133,6 +186,10 @@ int captureJpegCopy(CapturedJpeg* image) {
 
   image->data = nullptr;
   image->len = 0;
+
+  // Kamera aufwecken
+  cameraWake();
+  delay(100);  // Sensor stabilisieren lassen
 
   camera_fb_t* fb = nullptr;
   for (int attempt = 1; attempt <= 3; attempt++) {
@@ -161,10 +218,14 @@ int captureJpegCopy(CapturedJpeg* image) {
       return -1;
     }
 
-    delay(500);
+    // initCamera() legt Kamera schlafen, also wieder aufwecken
+    cameraWake();
+    delay(100);
+
     fb = esp_camera_fb_get();
     if (!fb) {
       Serial.println("Aufnahme nach Kamera-Reinit fehlgeschlagen");
+      cameraSleep();
       return -1;
     }
   }
@@ -181,6 +242,7 @@ int captureJpegCopy(CapturedJpeg* image) {
   if (!copy) {
     Serial.println("Speicher fuer Bildkopie fehlgeschlagen");
     esp_camera_fb_return(fb);
+    cameraSleep();
     return -6;
   }
 
@@ -189,6 +251,9 @@ int captureJpegCopy(CapturedJpeg* image) {
 
   image->data = copy;
   image->len = len;
+
+  // Kamera wieder schlafen legen
+  cameraSleep();
 
   return 0;
 }
